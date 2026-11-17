@@ -340,9 +340,10 @@ async function runWorkload(spec, ctx, forge) {
   }
   const after = await forge.readStats();
 
-  const opsPerRound = concurrent ? spec.ops : spec.ops;
-  const writes = before !== null && after !== null ? after.writes - before.writes : Number.NaN;
-  const responses = before !== null && after !== null ? after.responses - before.responses : Number.NaN;
+  const opsPerRound = spec.ops;
+  const delta = (field) => (before !== null && after !== null ? after[field] - before[field] : Number.NaN);
+  const writes = delta('writes');
+  const responses = delta('responses');
   return {
     name: spec.name,
     roundsMs: roundsMs.map((ms) => Math.round(ms * 1000) / 1000),
@@ -351,6 +352,7 @@ async function runWorkload(spec, ctx, forge) {
     writesPerRound: writes / ctx.rounds,
     responsesPerRound: responses / ctx.rounds,
     writesPerResponse: writes / responses,
+    readsPerRound: delta('reads') / ctx.rounds,
     opsPerRound,
     points: points(median(roundsMs), spec.tRef),
   };
@@ -418,6 +420,7 @@ async function main() {
       writesPerRound: median(across.map((r) => r.writesPerRound)),
       responsesPerRound: median(across.map((r) => r.responsesPerRound)),
       writesPerResponse: median(across.map((r) => r.writesPerResponse)),
+      readsPerRound: median(across.map((r) => r.readsPerRound)),
       points: median(across.map((r) => r.points)),
       runs: across.map((r) => ({ p50Ms: r.p50Ms, cpuMs: r.cpuMs })),
     };
@@ -426,10 +429,10 @@ async function main() {
   const geomean = Math.exp(results.reduce((sum, r) => sum + Math.log(r.p50Ms), 0) / results.length);
   const pad = (text, width) => String(text).padStart(width);
   console.log('');
-  console.log(`workload   wall p50 ms   forge cpu ms   writes/round   writes/resp   pts (local)`);
+  console.log(`workload   wall p50 ms   forge cpu ms   reads/round   writes/round   writes/resp   pts`);
   for (const r of results) {
     console.log(
-      `${r.name.padEnd(8)} ${pad(r.p50Ms.toFixed(1), 12)} ${pad(r.cpuMs.toFixed(1), 14)} ${pad(Math.round(r.writesPerRound), 14)} ${pad(r.writesPerResponse.toFixed(2), 13)} ${pad(r.points, 13)}`,
+      `${r.name.padEnd(8)} ${pad(r.p50Ms.toFixed(1), 12)} ${pad(r.cpuMs.toFixed(1), 14)} ${pad(Math.round(r.readsPerRound), 13)} ${pad(Math.round(r.writesPerRound), 14)} ${pad(r.writesPerResponse.toFixed(2), 13)} ${pad(r.points, 5)}`,
     );
   }
   console.log('');

@@ -13,7 +13,7 @@
 import { writeFileSync } from 'node:fs';
 import { Session } from 'node:inspector';
 import type { Server } from 'node:net';
-import { responsesWritten } from './http/server.ts';
+import { counters as serverCounters } from './http/server.ts';
 import { note } from './log.ts';
 
 /** The handle methods libuv turns into a write(2)/writev(2) on the socket. */
@@ -37,7 +37,7 @@ export function install(server: Server): void {
     }
   });
   process.on('SIGUSR2', () => {
-    note('[forge-stats]', JSON.stringify({ writes, responses: responsesWritten() }));
+    note('[forge-stats]', JSON.stringify({ ...serverCounters(), writes }));
   });
   if (process.env.FORGE_PROF !== undefined && process.env.FORGE_PROF !== '') installProfiler(process.env.FORGE_PROF);
 }

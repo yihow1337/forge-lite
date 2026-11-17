@@ -122,9 +122,18 @@ function nextRequestId(): string {
 /** Every answer written, stamped or not; tools/bench.mjs reads it through src/stats.ts. */
 let responses = 0;
 
-/** How many answers the forge has written (tools/bench.mjs reads it through src/stats.ts). */
-export function responsesWritten(): number {
-  return responses;
+/**
+ * Set only by tools/bench.mjs. Counting the reads is how the bench tool tells "the client sent
+ * this request in one segment" from "it sent the head and the body separately", which is the
+ * difference between one read syscall a request and two.
+ */
+const MEASURING = process.env.FORGE_STATS === '1';
+let reads = 0;
+let readBytes = 0;
+
+/** The counters src/stats.ts dumps on SIGUSR2. */
+export function counters(): Record<string, number> {
+  return { responses, reads, readBytes };
 }
 
 // ---------------------------------------------------------------- header matching
@@ -427,6 +436,10 @@ export function createForgeServer(handler: ForgeHandler): ForgeServer {
     live.add(socket);
     const conn: Conn = { socket, buf: EMPTY, scan: 0, head: null, bodyAt: 0, chunks: [], chunkSize: 0, dead: false };
     socket.on('data', (chunk: Buffer) => {
+      if (MEASURING) {
+        reads += 1;
+        readBytes += chunk.length;
+      }
       conn.buf = conn.buf.length === 0 ? chunk : Buffer.concat([conn.buf, chunk]);
       drain(conn, handler);
     });

@@ -22,6 +22,37 @@ export const MAX_OBJECT_BYTES = 64 * 1024 * 1024;
 
 const FLUSH = Buffer.from('0000', 'latin1');
 const DELIM = Buffer.from('0001', 'latin1');
+/** The one empty payload every control packet shares: decoding a pack must not allocate per flush. */
+const NO_PAYLOAD = Buffer.alloc(0);
+
+/** The four hex length bytes of a pkt-line carrying `bytes` payload bytes. */
+function pktLength(bytes: number): string {
+  const hex = (bytes + 4).toString(16);
+  return hex.length === 4 ? hex : `000${hex}`.slice(-4);
+}
+
+/**
+ * One pkt-line as text. Every answer this forge builds is a handful of short lines, and building
+ * them as one string and encoding it once costs one allocation where a Buffer per line costs two
+ * apiece plus the concat that joins them.
+ */
+export function pktText(payload: string): string {
+  return pktLength(Buffer.byteLength(payload)) + payload;
+}
+
+/** The flush packet, as text. */
+export const FLUSH_TEXT = '0000';
+/** The delimiter packet, as text. */
+export const DELIM_TEXT = '0001';
+
+/**
+ * `payload` framed as a single band-1 sideband packet, as text. The caller must have checked that
+ * it fits in one packet (SIDEBAND_CHUNK); everything the forge sideband-wraps as text is a
+ * report-status of a few short lines.
+ */
+export function sidebandText(payload: string): string {
+  return pktLength(Buffer.byteLength(payload) + 1) + '\u0001' + payload;
+}
 
 /** The flush packet. */
 export function flushPkt(): Buffer {
@@ -37,7 +68,7 @@ export function delimPkt(): Buffer {
 export function pkt(payload: string | Buffer): Buffer {
   const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
   const out = Buffer.allocUnsafe(data.length + 4);
-  out.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'latin1');
+  out.write(pktLength(data.length), 0, 4, 'latin1');
   data.copy(out, 4);
   return out;
 }
@@ -73,30 +104,49 @@ export interface DecodeResult {
   offset: number;
 }
 
-const HEX4 = /^[0-9a-fA-F]{4}$/;
+/** One hex digit's value, or -1. */
+function nibble(code: number): number {
+  if (code >= 48 && code <= 57) return code - 48;
+  if (code >= 97 && code <= 102) return code - 87;
+  if (code >= 65 && code <= 70) return code - 55;
+  return -1;
+}
+
+/**
+ * The four hex bytes at `offset` as a number, or -1 when any of them is not a hex digit. Read
+ * straight off the buffer: a pack and an upload-pack request are hundreds of pkt-lines, and a
+ * string plus a regular expression per line is the single biggest cost of parsing one.
+ */
+function pktHeader(buffer: Buffer, offset: number): number {
+  const a = nibble(buffer[offset] as number);
+  const b = nibble(buffer[offset + 1] as number);
+  const c = nibble(buffer[offset + 2] as number);
+  const d = nibble(buffer[offset + 3] as number);
+  if (a < 0 || b < 0 || c < 0 || d < 0) return -1;
+  return a * 4096 + b * 256 + c * 16 + d;
+}
 
 /** Decode pkt-lines until `stopAtFlush` (default) or the buffer ends. Throws on a malformed header. */
 export function decodePktLines(buffer: Buffer, start = 0, stopAtFlush = false): DecodeResult {
   const packets: Packet[] = [];
   let offset = start;
   while (offset + 4 <= buffer.length) {
-    const header = buffer.toString('latin1', offset, offset + 4);
-    if (!HEX4.test(header)) throw new Error(`invalid pkt-line length ${JSON.stringify(header)}`);
-    const length = Number.parseInt(header, 16);
+    const length = pktHeader(buffer, offset);
+    if (length < 0) throw new Error(`invalid pkt-line length ${JSON.stringify(buffer.toString('latin1', offset, offset + 4))}`);
     if (length === 0) {
       offset += 4;
-      packets.push({ kind: 'flush', payload: Buffer.alloc(0) });
+      packets.push({ kind: 'flush', payload: NO_PAYLOAD });
       if (stopAtFlush) break;
       continue;
     }
     if (length === 1) {
       offset += 4;
-      packets.push({ kind: 'delim', payload: Buffer.alloc(0) });
+      packets.push({ kind: 'delim', payload: NO_PAYLOAD });
       continue;
     }
     if (length === 2) {
       offset += 4;
-      packets.push({ kind: 'response-end', payload: Buffer.alloc(0) });
+      packets.push({ kind: 'response-end', payload: NO_PAYLOAD });
       continue;
     }
     if (length < 4 || offset + length > buffer.length) throw new Error(`truncated pkt-line of ${length} bytes`);
@@ -153,6 +203,15 @@ interface RawEntry {
   oid?: string;
   type?: GitObjectType;
   resolved?: Buffer;
+}
+
+/** One options object for every inflate: the hot path must not allocate one per object. */
+const INFLATE_OPTIONS = Object.freeze({ info: true, maxOutputLength: MAX_OBJECT_BYTES });
+
+/** What inflateSync answers in `info` mode: the bytes, and how many input bytes it consumed. */
+interface InflateInfo {
+  buffer: Buffer;
+  engine: { bytesWritten: number };
 }
 
 function readSizeHeader(buffer: Buffer, start: number): { size: number; next: number; first: number } {
@@ -249,7 +308,7 @@ export function readPack(pack: Buffer, existing?: ObjectStore): Map<string, GitO
   const objects = new Map<string, GitObject>();
   if (pack.length === 0) return objects;
   if (pack.length < 32) throw new Error(`a pack of ${pack.length} bytes is too short`);
-  if (pack.toString('latin1', 0, 4) !== 'PACK') throw new Error('the pack does not start with PACK');
+  if (pack[0] !== 0x50 || pack[1] !== 0x41 || pack[2] !== 0x43 || pack[3] !== 0x4b) throw new Error('the pack does not start with PACK');
   const version = pack.readUInt32BE(4);
   if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
   const count = pack.readUInt32BE(8);
@@ -262,28 +321,42 @@ export function readPack(pack: Buffer, existing?: ObjectStore): Map<string, GitO
 
   const raw: RawEntry[] = [];
   const byOffset = new Map<number, RawEntry>();
+  let deltas = false;
   let offset = 12;
   for (let index = 0; index < count; index += 1) {
     const entryOffset = offset;
     const header = readSizeHeader(body, offset);
     offset = header.next;
     const typeCode = (header.first >> 4) & 0x07;
-    const entry: RawEntry = { offset: entryOffset, typeCode, size: header.size, data: Buffer.alloc(0) };
+    const entry: RawEntry = { offset: entryOffset, typeCode, size: header.size, data: NO_PAYLOAD };
     if (typeCode === 6) {
       const base = readOfsBase(body, offset);
       offset = base.next;
       entry.baseOffset = entryOffset - base.delta;
+      deltas = true;
     } else if (typeCode === 7) {
       entry.baseOid = body.toString('hex', offset, offset + 20);
       offset += 20;
+      deltas = true;
     } else if (CODE_TYPE[typeCode] === undefined) {
       throw new Error(`pack entry ${index} has type code ${typeCode}`);
     }
-    const inflated = inflateSync(body.subarray(offset), { info: true, maxOutputLength: MAX_OBJECT_BYTES }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
+    const inflated = inflateSync(body.subarray(offset), INFLATE_OPTIONS) as unknown as InflateInfo;
     entry.data = inflated.buffer;
     offset += inflated.engine.bytesWritten;
     raw.push(entry);
     byOffset.set(entryOffset, entry);
+  }
+
+  // A pack with no delta entries -- which is every pack the suite pushes, and every pack git
+  // sends with thin-pack off -- needs none of the resolution bookkeeping below: each entry is
+  // already its own object, and the only work left is naming it.
+  if (!deltas) {
+    for (const entry of raw) {
+      const type = CODE_TYPE[entry.typeCode] as GitObjectType;
+      objects.set(hashObject(type, entry.data), { type, data: entry.data });
+    }
+    return objects;
   }
 
   const byOid = new Map<string, RawEntry>();

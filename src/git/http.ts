@@ -14,7 +14,7 @@ import {
   reachable,
   type GitObject,
 } from './objects.ts';
-import { decodePktLines, delimPkt, flushPkt, pkt, readPack, sidebandChunks, writePack } from './pack.ts';
+import { DELIM_TEXT, FLUSH_TEXT, decodePktLines, delimPkt, flushPkt, pkt, pktText, readPack, sidebandChunks, sidebandText, writePack } from './pack.ts';
 import { touchGit, type RepoRec, type Store } from '../store.ts';
 
 /** The agent string this forge advertises. */
@@ -60,6 +60,10 @@ const UPLOAD_V0_CAPS = [
 ];
 
 const RECEIVE_V0_CAPS = ['report-status', 'report-status-v2', 'delete-refs', 'side-band-64k', 'ofs-delta', 'object-format=sha1', `agent=${AGENT}`];
+
+/** The two capability lists as the wire carries them, joined once rather than once an answer. */
+const UPLOAD_V0_CAPS_TEXT = UPLOAD_V0_CAPS.join(' ');
+const RECEIVE_V0_CAPS_TEXT = RECEIVE_V0_CAPS.join(' ');
 
 function textReply(status: number, text: string): GitReply {
   return { status, type: 'text/plain; charset=utf-8', body: Buffer.from(text, 'utf8') };
@@ -122,28 +126,28 @@ function cached(repo: RepoRec, key: string, build: () => Buffer): Buffer {
   return built;
 }
 
-/** The v0 ref advertisement body for one service. */
-function v0Advertisement(repo: RepoRec, service: string, caps: readonly string[]): Buffer {
-  const refs = advertisedRefs(repo);
-  const real = refs.filter((ref) => !(ref.unborn === true));
-  const parts: Buffer[] = [pkt(`# service=${service}\n`), flushPkt()];
-  if (real.length === 0) {
-    parts.push(pkt(`${ZERO_OID} capabilities^{}\u0000${caps.join(' ')}\n`));
-  } else {
-    let first = true;
-    for (const ref of real) {
-      parts.push(pkt(first ? `${ref.oid} ${ref.name}\u0000${caps.join(' ')}\n` : `${ref.oid} ${ref.name}\n`));
-      first = false;
-      if (ref.peeled !== undefined) parts.push(pkt(`${ref.peeled} ${ref.name}^{}\n`));
-    }
+/**
+ * The v0 ref advertisement body for one service. Built as one string and encoded once: the push
+ * workload asks for this advertisement before every one of its two hundred pushes, and each push
+ * bumps the repository's version, so this is rebuilt two hundred times a round and must not cost
+ * a Buffer per pkt-line plus the concat that joins them.
+ */
+function v0Advertisement(repo: RepoRec, service: string, caps: string): Buffer {
+  let text = `${pktText(`# service=${service}\n`)}${FLUSH_TEXT}`;
+  let first = true;
+  for (const ref of advertisedRefs(repo)) {
+    if (ref.unborn === true) continue;
+    text += pktText(first ? `${ref.oid} ${ref.name}\u0000${caps}\n` : `${ref.oid} ${ref.name}\n`);
+    first = false;
+    if (ref.peeled !== undefined) text += pktText(`${ref.peeled} ${ref.name}^{}\n`);
   }
-  parts.push(flushPkt());
-  return Buffer.concat(parts);
+  if (first) text += pktText(`${ZERO_OID} capabilities^{}\u0000${caps}\n`);
+  return Buffer.from(`${text}${FLUSH_TEXT}`, 'utf8');
 }
 
 /** The capability list a v0 upload-pack advertisement carries (the symref is the repo's HEAD). */
-function uploadCaps(repo: RepoRec): string[] {
-  return [...UPLOAD_V0_CAPS, `symref=HEAD:refs/heads/${repo.defaultBranch}`];
+function uploadCaps(repo: RepoRec): string {
+  return `${UPLOAD_V0_CAPS_TEXT} symref=HEAD:refs/heads/${repo.defaultBranch}`;
 }
 
 // ---------------------------------------------------------------- ls-refs
@@ -156,17 +160,16 @@ interface LsRefsArgs {
 }
 
 function lsRefs(repo: RepoRec, args: LsRefsArgs): Buffer {
-  const parts: Buffer[] = [];
+  let text = '';
   for (const ref of advertisedRefs(repo)) {
     if (ref.unborn === true && !args.unborn) continue;
     if (args.prefixes.length > 0 && !args.prefixes.some((prefix) => ref.name.startsWith(prefix))) continue;
     let line = ref.unborn === true ? `unborn ${ref.name}` : `${ref.oid} ${ref.name}`;
     if (args.symrefs && ref.symrefTarget !== undefined) line += ` symref-target:${ref.symrefTarget}`;
     if (args.peel && ref.peeled !== undefined) line += ` peeled:${ref.peeled}`;
-    parts.push(pkt(`${line}\n`));
+    text += pktText(`${line}\n`);
   }
-  parts.push(flushPkt());
-  return Buffer.concat(parts);
+  return Buffer.from(`${text}${FLUSH_TEXT}`, 'utf8');
 }
 
 // ---------------------------------------------------------------- fetch
@@ -281,6 +284,12 @@ interface Command {
   ref: string;
 }
 
+/** One pkt-line's payload as text, without its trailing newline and without a regular expression. */
+function lineOf(payload: Buffer): string {
+  const end = payload.length > 0 && payload[payload.length - 1] === 10 ? payload.length - 1 : payload.length;
+  return payload.toString('utf8', 0, end);
+}
+
 function parseReceiveRequest(body: Buffer): { commands: Command[]; caps: Set<string>; pack: Buffer } {
   const decoded = decodePktLines(body, 0, true);
   const commands: Command[] = [];
@@ -288,7 +297,7 @@ function parseReceiveRequest(body: Buffer): { commands: Command[]; caps: Set<str
   let first = true;
   for (const packet of decoded.packets) {
     if (packet.kind !== 'data') continue;
-    let line = packet.payload.toString('utf8').replace(/\n$/, '');
+    let line = lineOf(packet.payload);
     if (first) {
       const nul = line.indexOf('\u0000');
       if (nul >= 0) {
@@ -340,7 +349,7 @@ export function handleGit(store: Store, request: GitHttpRequest): GitReply | nul
       if (request.gitProtocolV2) return { status: 200, type: UPLOAD_ADVERT, body: V2_CAPABILITIES };
       return { status: 200, type: UPLOAD_ADVERT, body: cached(repo, 'adv0u', () => v0Advertisement(repo, service, uploadCaps(repo))) };
     }
-    return { status: 200, type: RECEIVE_ADVERT, body: cached(repo, 'adv0r', () => v0Advertisement(repo, service, RECEIVE_V0_CAPS)) };
+    return { status: 200, type: RECEIVE_ADVERT, body: cached(repo, 'adv0r', () => v0Advertisement(repo, service, RECEIVE_V0_CAPS_TEXT)) };
   }
 
   if (request.method !== 'POST') return textReply(405, 'method not allowed\n');
@@ -364,7 +373,7 @@ export function handleGit(store: Store, request: GitHttpRequest): GitReply | nul
 function uploadPack(repo: RepoRec, request: GitHttpRequest): GitReply {
   const decoded = decodePktLines(request.body, 0, false);
   const lines: string[] = [];
-  for (const packet of decoded.packets) if (packet.kind === 'data') lines.push(packet.payload.toString('utf8').replace(/\n$/, ''));
+  for (const packet of decoded.packets) if (packet.kind === 'data') lines.push(lineOf(packet.payload));
 
   let command = '';
   for (const line of lines) {
@@ -458,7 +467,10 @@ function receivePack(repo: RepoRec, request: GitHttpRequest): GitReply {
   }
   if (changed || parsed.pack.length > 0) touchGit(repo);
 
-  const inner = Buffer.concat([...lines.map((line) => pkt(line)), flushPkt()]);
-  const body = sidebandWanted ? Buffer.concat([...sidebandChunks(inner), flushPkt()]) : inner;
-  return { status: 200, type: RECEIVE_RESULT, body };
+  // The report is a handful of short lines; one string and one encode, not a Buffer a line.
+  let inner = '';
+  for (const line of lines) inner += pktText(line);
+  inner += FLUSH_TEXT;
+  const text = sidebandWanted ? `${sidebandText(inner)}${FLUSH_TEXT}` : inner;
+  return { status: 200, type: RECEIVE_RESULT, body: Buffer.from(text, 'utf8') };
 }
