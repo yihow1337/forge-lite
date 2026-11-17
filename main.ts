@@ -1,8 +1,15 @@
-// main.ts -- the entry's lifecycle, and nothing else.
+// main.ts -- the entry's lifecycle, and the handover to the Go forge.
 //
-// The forge lives in ./app.ts. This file only does the four things the trial contract asks of the
-// process it starts:
+// THE HANDOVER
+//   The forge was ported to Go (./go, built to ./bin/forge by tools/build-go.sh). The harness runs
+//   `node /bot/main.ts`, so this file's first job is to hand the trial to that binary: spawn it
+//   with our stdio and our environment, forward SIGTERM, and exit with its code. The binary speaks
+//   the same wire and owns the same lifecycle, so from the env's side nothing changed.
 //
+//   If the binary cannot run -- it is absent, not executable, or the wrong format -- the Node forge
+//   below takes the trial instead, so a bad build costs some wall time rather than the whole score.
+//
+// THE LIFECYCLE, which both forges implement
 //   1. bind an ephemeral port -- listen(0), never 8080, which the env owns on the one-pod layout;
 //   2. announce that port with POST $MAKEFUN_ENV_URL/register {"port": N};
 //   3. poll GET $MAKEFUN_ENV_URL/done until the body carries done === true;
@@ -13,9 +20,13 @@
 // and a fresh DNS lookup every time. It must also never hold a request open -- the env answers a
 // poll at once, and the waiting happens here, between calls.
 
+import { spawn } from 'node:child_process';
+import { accessSync, constants } from 'node:fs';
 import * as http from 'node:http';
 import * as https from 'node:https';
 import type { RequestOptions } from 'node:http';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createApp } from './app.ts';
 import type { ForgeServer } from './src/http/server.ts';
 import { note } from './src/log.ts';
@@ -254,7 +265,85 @@ function leave(server: ForgeServer, agent: http.Agent, code: number): void {
   process.exit(code);
 }
 
+// ---------------------------------------------------------------- the Go forge
+
+/** Where the committed binary lives, relative to this file rather than to the cwd. */
+const FORGE_BINARY = join(dirname(fileURLToPath(import.meta.url)), 'bin', 'forge');
+
+/**
+ * How long after the binary starts an exit still counts as "it never got going". A binary that
+ * dies in its first moments has not registered yet, so the Node forge can still take the trial;
+ * one that dies an hour in has, and a second register would only confuse the env.
+ */
+const FORGE_STARTUP_MS = 3_000;
+
+/**
+ * Hand the trial to the Go forge. This resolves only when the binary could not take it -- it is
+ * absent, not executable, the wrong format, or it died before it could have registered -- which is
+ * the caller's signal to serve from Node instead. When the binary does take the trial this never
+ * resolves: the binary owns the lifecycle, and this process exits with the binary's code.
+ */
+async function delegate(): Promise<void> {
+  try {
+    accessSync(FORGE_BINARY, constants.X_OK);
+  } catch (err) {
+    log(`${FORGE_BINARY} is not runnable (${err instanceof Error ? err.message : String(err)}): serving from Node`);
+    return;
+  }
+
+  const child = spawn(FORGE_BINARY, [], { stdio: 'inherit', env: process.env });
+
+  const started = await new Promise<boolean>((resolve) => {
+    child.once('spawn', () => resolve(true));
+    child.once('error', (err: Error) => {
+      log(`${FORGE_BINARY} would not start (${err.message}): serving from Node`);
+      resolve(false);
+    });
+  });
+  if (!started) return;
+
+  const startedAt = Date.now();
+  // A later error -- an EPERM on kill, say -- must not become an unhandled 'error' event.
+  child.on('error', (err: Error) => log(`the Go forge reported ${err.message}`));
+
+  // The harness SIGTERMs the entry when the trial ends. The binary shuts down on it by itself, so
+  // all this has to do is pass it on and let the child's exit end this process.
+  const forward = (signal: NodeJS.Signals) => (): void => {
+    try {
+      child.kill(signal);
+    } catch {
+      // The child is already gone; its exit handler is what ends this process.
+    }
+  };
+  const handlers: Array<[NodeJS.Signals, () => void]> = [
+    ['SIGTERM', forward('SIGTERM')],
+    ['SIGINT', forward('SIGINT')],
+  ];
+  for (const [signal, handler] of handlers) process.on(signal, handler);
+
+  return await new Promise<void>((resolve) => {
+    child.once('exit', (code: number | null, signal: NodeJS.Signals | null) => {
+      const elapsed = Date.now() - startedAt;
+      if (code === 0) {
+        log('the Go forge finished');
+        process.exit(0);
+      }
+      if (elapsed < FORGE_STARTUP_MS) {
+        // It cannot have registered yet, so nothing is lost by taking over.
+        log(`the Go forge exited ${code ?? signal} after ${elapsed} ms without registering: serving from Node`);
+        for (const [held, handler] of handlers) process.removeListener(held, handler);
+        resolve();
+        return;
+      }
+      log(`the Go forge exited ${code ?? signal} after ${elapsed} ms`);
+      process.exit(code ?? 1);
+    });
+  });
+}
+
 async function main(): Promise<void> {
+  await delegate();
+
   const origin = envOrigin();
   const agent = new http.Agent({ keepAlive: true, keepAliveMsecs: 10_000, maxSockets: 4 });
   const server = createApp();
