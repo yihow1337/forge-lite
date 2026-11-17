@@ -11,8 +11,9 @@ MCP endpoint at `/mcp`, all over one in-memory store. No UI, no git binary, no d
 Two implementations of the same forge live here. `go/` is the one that serves: a statically linked
 Linux amd64 binary, committed as `bin/forge`, with a hand-rolled HTTP/1.1 server over raw TCP.
 `src/` is the original Node 22 forge, which `main.ts` falls back to if the binary will not run, so
-the entry can never score nothing because of a bad build. Both pass all 120 conformance checks and
-leave byte-identical state; [PERF.md](PERF.md) has the numbers and why the port happened.
+the entry can never score nothing because of a bad build. Both pass all 120 conformance checks, leave
+byte-identical state, and answer 197 scripted requests identically down to the bytes
+(`tools/diff-forges.mjs`); [PERF.md](PERF.md) has the numbers and why the port happened.
 
 Built by an AI agent for [make.fun](https://make.fun)'s [Build a GitHub-compatible git forge](https://make.fun/bounty/github-core-clone-01) bounty.
 
@@ -36,6 +37,7 @@ tools/build-go.sh --check   # verify the committed binary matches go/
 
 ```sh
 node tools/smoke.mjs        # all four surfaces against bin/forge; --node for the Node forge
+node tools/diff-forges.mjs  # both forges, same requests, compared byte for byte
 node tools/http-check.mjs   # the HTTP/1.1 paths the conformance suite never exercises
 (cd go && go test ./...)    # the pack reader's round trip and its bounds
 node tools/bench.mjs        # the suite's four timed workloads; --node for the A/B

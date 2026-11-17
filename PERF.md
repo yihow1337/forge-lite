@@ -46,12 +46,23 @@ workload, the Go forge spends none and runs no collection at all in any round. S
 are unchanged and still minimal: **exactly one `read` and one `write` per response** on every
 workload, which `tools/bench.mjs`'s own counters confirm from inside the forge.
 
-The kit's own grader, run locally, reports `perf_p50_us` 101,956 for the Node forge and 110,496 /
-86,734 / 99,093 across three Go runs. It does not pin the forge and this box is shared, so that
-spread is noise and no claim is made from it; the interleaved, pinned table above is the
-measurement. What the grader does settle is **120/120 and `state.json` hashing to
-`a0e98d49854b961230227867235c8615858e006db3763f341ac6154af1445590` on every run of both forges** --
-the same bytes the scorer reads, so the port changed no answer the grader looks at.
+The kit's own grader, three runs each, the Node forge being this worktree with `bin/` removed so
+that `main.ts` falls back:
+
+| | run 1 | run 2 | run 3 | median |
+| --- | --- | --- | --- | --- |
+| node `perf_p50_us` | 94,040 | 112,630 | 117,515 | 112,630 |
+| go `perf_p50_us` | 85,913 | 85,216 | 99,328 | **85,913** |
+
+Every one of the six runs is 120/120 and score 1000, and the Go forge's worst run beats the Node
+forge's median. The grader does not pin the forge and this box is shared with other work, so the
+spread inside each row is noise -- a seventh Go run taken while another process held a third of a
+core scored perf 192, with a read round of 792 ms against the 299 ms round beside it. The
+interleaved, pinned table above is the measurement; this table is the grader agreeing with it.
+
+What the grader settles outright is determinism: `state.json` hashes to
+`a0e98d49854b961230227867235c8615858e006db3763f341ac6154af1445590` on **every run of both forges**,
+byte for byte, which is the replay check the final ranking depends on.
 
 ### Where the Go forge's CPU goes
 
@@ -75,6 +86,25 @@ Two hundred pushes a round, so that is eight megabytes of allocation a round tha
 happens. This is the one saving the Node forge could not have: `node:zlib` closes its binding at
 the end of a stream and `reset()` then throws `ERR_INTERNAL_ASSERTION`, which is written up under
 "What is left" below as a thing that could not be taken. In Go it is four lines.
+
+### Is it the same forge?
+
+The suite judges answers by shape, so a field it does not read could differ between the two
+implementations and all 120 checks would still pass. `tools/diff-forges.mjs` closes that gap: it
+starts both forges, replays one fixed, ordered sequence against each, and compares every status,
+every body and the headers that carry meaning -- including the ref advertisements and the packfiles
+as raw bytes, and the git wire driven through the suite's own `GitClient`. The order is fixed
+because both forges number ids from counters, so the same requests must produce the same ids.
+
+**197 comparisons, 0 differences.** Only `x-github-request-id` is normalised (it counts requests,
+and the two runs make a different number of them) along with the port each forge listens on.
+
+It found one real difference, on its first run: a malformed pkt-line's diagnostic rendered a NUL
+as `\x00` under Go's `%q` where the Node forge wrote `\u0000` through `JSON.stringify`. Nothing
+reads that text -- it is a `text/plain` 400 body -- but it is `jsonQuote` on both sides now,
+because a difference the tool has to explain away is a difference that hides the next one. Its
+other two first-run reports were the tool's own fault, the `Link` header's pagination URLs
+echoing each forge's own port, and the tool normalises the origin now.
 
 ### What the port had to be careful about
 
@@ -125,6 +155,7 @@ node tools/bench.mjs --only read --prof /tmp/go.prof
 go tool pprof -top bin/forge /tmp/go.prof       # where the Go forge's CPU goes
 (cd go && go test -bench . -benchmem -count=3)  # the handlers alone, and their allocations
 node tools/smoke.mjs                            # all four surfaces, fast; --node for the A/B
+node tools/diff-forges.mjs                      # the Go forge against the Node forge, byte for byte
 node tools/http-check.mjs                       # the wire paths the suite never exercises
 node tools/profile.mjs p.cpuprofile route drain writeReply      # Node only: inclusive shares
 node tools/micro.mjs                            # Node only: the handlers, no socket in the way

@@ -122,7 +122,10 @@ func decodePktLines(buf []byte, start int, stopAtFlush bool) ([]Packet, int, err
 	for offset+4 <= len(buf) {
 		length := pktHeader(buf, offset)
 		if length < 0 {
-			return nil, 0, fmt.Errorf("invalid pkt-line length %q", string(buf[offset:offset+4]))
+			// jsonQuote, not %q: the Node forge quoted this with JSON.stringify, and the two
+			// render a NUL differently (\u0000 against \x00). Nothing reads this text, but a
+			// difference in it is a difference tools/diff-forges.mjs has to explain away.
+			return nil, 0, errors.New("invalid pkt-line length " + jsonQuote(string(buf[offset:offset+4])))
 		}
 		if length == 0 {
 			offset += 4
