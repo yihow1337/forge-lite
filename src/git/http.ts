@@ -363,7 +363,8 @@ function uploadPack(repo: RepoRec, request: GitHttpRequest): GitReply {
       else if (line === 'unborn') args.unborn = true;
       else if (line.startsWith('ref-prefix ')) args.prefixes.push(line.slice('ref-prefix '.length));
     }
-    return { status: 200, type: UPLOAD_RESULT, body: lsRefs(repo, args) };
+    const key = `ls|${args.peel ? 1 : 0}${args.symrefs ? 1 : 0}${args.unborn ? 1 : 0}|${args.prefixes.join(',')}`;
+    return { status: 200, type: UPLOAD_RESULT, body: cached(repo, key, () => lsRefs(repo, args)) };
   }
 
   const args: FetchArgs = { wants: [], haves: [], shallow: [], depth: null, done: false };
