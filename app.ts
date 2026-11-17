@@ -24,6 +24,15 @@ const EMPTY_BODY = Buffer.alloc(0);
 const EMPTY_QUERY = new URLSearchParams();
 const HEALTHZ = '{"ok":true}';
 const NOT_FOUND_JSON = '{"message":"Not Found","documentation_url":"https://docs.github.com/rest"}';
+const TOO_LARGE_JSON = '{"message":"Request body is too large","documentation_url":"https://docs.github.com/rest"}';
+
+/**
+ * The most bytes a request body may carry. Every surface here buffers the whole body before it
+ * routes -- a push needs its pack in one piece -- so without a ceiling one endless upload grows the
+ * heap until the process dies and the trial scores nothing. The suite's largest body is a pack of a
+ * few hundred kilobytes; anything past this is answered 413 and the socket is let go.
+ */
+const MAX_BODY_BYTES = 64 * 1024 * 1024;
 
 let requestSeq = 0;
 
@@ -203,11 +212,21 @@ export function createApp(): Server {
     }
     const chunks: Buffer[] = [];
     let size = 0;
+    let overflowed = false;
     req.on('data', (chunk: Buffer) => {
-      chunks.push(chunk);
+      if (overflowed) return;
       size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        overflowed = true;
+        chunks.length = 0;
+        sendJson(res, 413, TOO_LARGE_JSON);
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
     });
     req.on('end', () => {
+      if (overflowed) return;
       try {
         route(req, res, size === 0 ? EMPTY_BODY : chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks, size));
       } catch (err) {

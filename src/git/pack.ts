@@ -11,6 +11,15 @@ export const PKT_LINE_MAX_PAYLOAD = PKT_LINE_MAX - 4;
 /** The band-1 chunk size a packfile section is framed at (payload, band byte included). */
 export const SIDEBAND_CHUNK = 65_515;
 
+/**
+ * The most bytes one object a client pushes may inflate or expand to. A packed object declares its
+ * own size -- a delta names its target size in a varint, a zlib stream names nothing at all -- so an
+ * unbounded reader lets a few hundred bytes on the wire ask for gigabytes of heap. Nothing the suite
+ * pushes comes near this; a pack that does is a broken pack, and a broken pack gets an error rather
+ * than the process's memory.
+ */
+export const MAX_OBJECT_BYTES = 64 * 1024 * 1024;
+
 const FLUSH = Buffer.from('0000', 'latin1');
 const DELIM = Buffer.from('0001', 'latin1');
 
@@ -190,6 +199,9 @@ export function applyDelta(base: Buffer, delta: Buffer): Buffer {
   };
   readVarint();
   const targetSize = readVarint();
+  if (!Number.isFinite(targetSize) || targetSize < 0 || targetSize > MAX_OBJECT_BYTES) {
+    throw new Error(`a delta asks for ${targetSize} bytes, past the ${MAX_OBJECT_BYTES}-byte object limit`);
+  }
   const out = Buffer.allocUnsafe(targetSize);
   let written = 0;
   while (offset < delta.length) {
@@ -243,6 +255,10 @@ export function readPack(pack: Buffer, existing?: ObjectStore): Map<string, GitO
   const count = pack.readUInt32BE(8);
   const trailerStart = pack.length - 20;
   const body = pack.subarray(0, trailerStart);
+  // The header's count is four client-supplied bytes. Every entry costs at least a header byte and a
+  // zlib stream, so a count past the body's length describes a pack that cannot exist: refuse it here
+  // rather than letting the loop below grow an entry list toward four billion.
+  if (count > body.length) throw new Error(`a pack of ${body.length} bytes claims ${count} objects`);
 
   const raw: RawEntry[] = [];
   const byOffset = new Map<number, RawEntry>();
@@ -263,7 +279,7 @@ export function readPack(pack: Buffer, existing?: ObjectStore): Map<string, GitO
     } else if (CODE_TYPE[typeCode] === undefined) {
       throw new Error(`pack entry ${index} has type code ${typeCode}`);
     }
-    const inflated = inflateSync(body.subarray(offset), { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
+    const inflated = inflateSync(body.subarray(offset), { info: true, maxOutputLength: MAX_OBJECT_BYTES }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
     entry.data = inflated.buffer;
     offset += inflated.engine.bytesWritten;
     raw.push(entry);

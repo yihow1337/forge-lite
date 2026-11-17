@@ -94,11 +94,30 @@ function advertisedRefs(repo: RepoRec): AdvertisedRef[] {
   return out;
 }
 
+/**
+ * How many built answers one repository keeps. A cache key carries what the client asked for -- its
+ * wants, its haves, its ref-prefixes -- so the number of distinct keys at one repository version is
+ * the client's to choose, and each value is a whole packfile. The benchmark's clones repeat one key
+ * and the conformance checks use a few dozen, so this ceiling is never reached by honest traffic; it
+ * is here so that varied traffic costs a bounded amount of heap instead of a growing one.
+ */
+const CACHE_ENTRIES_MAX = 64;
+
 function cached(repo: RepoRec, key: string, build: () => Buffer): Buffer {
   const full = `${repo.version}|${key}`;
   const hit = repo.cache.get(full);
-  if (hit !== undefined) return hit;
+  if (hit !== undefined) {
+    // Refresh the entry's place in the Map's insertion order: eviction below drops the coldest key.
+    repo.cache.delete(full);
+    repo.cache.set(full, hit);
+    return hit;
+  }
   const built = build();
+  while (repo.cache.size >= CACHE_ENTRIES_MAX) {
+    const coldest = repo.cache.keys().next();
+    if (coldest.done === true) break;
+    repo.cache.delete(coldest.value);
+  }
   repo.cache.set(full, built);
   return built;
 }
