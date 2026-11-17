@@ -41,7 +41,9 @@ const GRAPHQL_BAD_JSON: ForgeReply = { status: 400, type: JSON_TYPE, body: '{"er
 /** Split a path into percent-decoded segments, dropping the empty ones. */
 function segmentsOf(path: string): string[] {
   const out: string[] = [];
-  let start = 1;
+  // From 0, not 1: a target that does not begin with '/' (absolute-form, which no client here
+  // sends, but which a proxy may) must not lose its first character to the assumption.
+  let start = 0;
   for (;;) {
     const slash = path.indexOf('/', start);
     const end = slash < 0 ? path.length : slash;
