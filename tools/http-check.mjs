@@ -160,6 +160,31 @@ try {
   }
 
   {
+    // The head, then the body in two more segments. A server that re-parses the head on every
+    // read -- which is what the Go server did until the head was kept on the connection -- writes
+    // one "100 Continue" per segment, and a strict client sees an unexpected interim answer.
+    const payload = JSON.stringify({ name: 'http-check-continue-split' });
+    const half = Math.floor(payload.length / 2);
+    const pieces = [
+      `POST /api/v3/user/repos HTTP/1.1\r\n${host}${auth}content-type: application/json\r\nexpect: 100-continue\r\ncontent-length: ${payload.length}\r\n\r\n`,
+      payload.slice(0, half),
+      payload.slice(half),
+    ];
+    const socket = connect(PORT, '127.0.0.1');
+    await new Promise((r) => socket.once('connect', r));
+    const answer = await new Promise((resolve) => {
+      const chunks = [];
+      socket.on('data', (c) => chunks.push(c));
+      pieces.forEach((piece, index) => setTimeout(() => socket.write(piece), index * 60));
+      setTimeout(() => resolve(Buffer.concat(chunks).toString('latin1')), 1_500);
+    });
+    socket.destroy();
+    const interim = answer.split('HTTP/1.1 100 Continue').length - 1;
+    check('a split 100-continue body gets exactly one interim answer', interim === 1, `${interim} interim answers`);
+    check('and the request still lands', answer.includes('HTTP/1.1 201 '), answer.split('\r\n')[0]);
+  }
+
+  {
     const answer = await speak(PORT, `HEAD /healthz HTTP/1.1\r\n${host}${auth}\r\n`);
     check('HEAD sends the headers and no body', answer.startsWith('HTTP/1.1 200 ') && answer.includes('content-length: 11') && answer.endsWith('\r\n\r\n'), JSON.stringify(answer.slice(-20)));
   }

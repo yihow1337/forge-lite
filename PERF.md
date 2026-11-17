@@ -1,5 +1,10 @@
 # Performance
 
+> **The forge is Go now.** `go/` serves every trial; `src/` is the fallback `main.ts` reaches for
+> when `bin/forge` will not run. Everything below the "The server core is Go" section is the Node
+> work that came first, kept because it is what the Go port was measured against and because the
+> Node forge is still the thing that answers if the binary is missing.
+
 The forge is graded on wall time inside a gVisor sandbox that shares a node with the suite
 measuring it. There, a syscall and a page fault cost many times what they cost on a normal kernel,
 and the entry's two CPUs are the same two the grader's clock is running against, so every
@@ -7,18 +12,128 @@ millisecond of CPU the forge does not spend is a millisecond the round does not 
 workload already tops out at 50 points, so **local wall time is a poor guide; forge CPU per request
 and syscalls per response are what this file tracks.**
 
+## The server core is Go
+
+### Why
+
+Four interleaved pairs of Node benchmark runs had taken **-43% of the forge's CPU** out of the
+Node forge, and the grader's perf column did not move: `perf_p50_us` stayed near 550,000 and perf
+stayed at 124-128 of 200. The graded sandbox is roughly six times slower per request than this box
+(a graded read round of about 1.9 s against 0.25 s here for the same 2,000 requests), so what it
+charges for is not the handler's arithmetic -- it is the per-request floor: syscalls through
+gVisor's Sentry, the runtime underneath them, and whatever a collector does while the clock runs.
+Node's floor is the part that could not be optimised away in Node. The leaderboard agreed: its top
+entries (perf 155-166, geomean 320-380 ms) are static Go or C binaries.
+
+The rules allow one -- "a statically linked Linux amd64 binary you commit runs from your repository
+as vendored source" -- so `go/` is the whole forge again, stdlib only, and `main.ts` hands it the
+trial.
+
+### Result
+
+Two interleaved passes, each the median of three whole benchmark runs, forge pinned to one core:
+
+| workload | node wall | go wall | Δ wall | node cpu | go cpu | **Δ cpu** |
+| --- | --- | --- | --- | --- | --- | --- |
+| push | 161.0 ms | 100.2 ms | **-37.8%** | 62.7 ms | 11.6 ms | **-81.5%** |
+| clone | 36.3 ms | 33.0 ms | -9.1% | 10.4 ms | 3.6 ms | **-65.5%** |
+| read | 260.1 ms | 224.9 ms | -13.5% | 47.8 ms | 30.1 ms | **-37.1%** |
+| write | 39.0 ms | 35.3 ms | -9.6% | 7.3 ms | 4.4 ms | **-40.4%** |
+| **geomean / total** | **87.6 ms** | **71.1 ms** | **-18.8%** | **128.1 ms** | **49.6 ms** | **-61.3%** |
+
+Collection time went with it: the Node forge spent 8.5-13.4 ms a round collecting on the push
+workload, the Go forge spends none and runs no collection at all in any round. Syscalls per request
+are unchanged and still minimal: **exactly one `read` and one `write` per response** on every
+workload, which `tools/bench.mjs`'s own counters confirm from inside the forge.
+
+The kit's own grader, run locally, reports `perf_p50_us` 101,956 for the Node forge and 110,496 /
+86,734 / 99,093 across three Go runs. It does not pin the forge and this box is shared, so that
+spread is noise and no claim is made from it; the interleaved, pinned table above is the
+measurement. What the grader does settle is **120/120 and `state.json` hashing to
+`a0e98d49854b961230227867235c8615858e006db3763f341ac6154af1445590` on every run of both forges** --
+the same bytes the scorer reads, so the port changed no answer the grader looks at.
+
+### Where the Go forge's CPU goes
+
+A `pprof` profile of the read workload (`FORGE_PROF=... `, SIGUSR1 to start and stop, which
+`tools/bench.mjs --prof` drives) puts **87.5% of the forge's busy time in the `read` and `write`
+syscalls themselves**, 12.5% in `mallocgc`, and nothing else above the noise. At 16.6 us of CPU per
+keep-alive request there is about 2 us of addressable work left in the whole read path, so that
+path is finished: the remaining cost is the two syscalls, and they are the work.
+
+The push path was not finished, and the profile said why: half of its handler was `readPack`, and a
+sixth of the whole forge was inside `compress/zlib.NewReader`. `readPack` built its inflater per
+call, and a flate decompressor carries a 32 KiB window and its Huffman tables. One `sync.Pool`
+later, measured by `go/pack_test.go` because this box cannot read a 2 ms wall change:
+
+| | ns/op | B/op | allocs/op |
+| --- | --- | --- | --- |
+| `readPack`, an engine per pack | 14,448 | 42,892 | 23 |
+| `readPack`, a pooled engine | 6,851 | 2,286 | 17 |
+
+Two hundred pushes a round, so that is eight megabytes of allocation a round that no longer
+happens. This is the one saving the Node forge could not have: `node:zlib` closes its binding at
+the end of a stream and `reset()` then throws `ERR_INTERNAL_ASSERTION`, which is written up under
+"What is left" below as a thing that could not be taken. In Go it is four lines.
+
+### What the port had to be careful about
+
+Three things, none of them visible from the TypeScript:
+
+* **A Go map iterates in a random order.** Everywhere the TypeScript leaned on a JS `Map` or `Set`
+  keeping its insertion order, the Go carries the order explicitly: `oidSet` for the reachability
+  walk (which is what fixes a packfile's object order), `repoOrder` for `/user/repos`, `LabelOrder`
+  for the label list, `cacheKeys` for the git answer cache's eviction. Without that, two runs of
+  the same requests would differ in bytes even though every check still passed, and `state.json`
+  would stop hashing the same.
+* **One mutex guards the whole store.** There is no parallelism to win on the suite's hot paths --
+  the read workload is one keep-alive connection and the clone workload is fifty replays of one
+  cached buffer -- and interleaved mutations would make the id counters depend on arrival order.
+  The lock is held for the handler only, never across a socket write.
+* **`GOMAXPROCS` and the collector.** Capped at 2, which is the pod's limit, so a runtime that sees
+  the host's eight CPUs does not run eight Ps against two. `GOGC` 400 and a 720 MiB soft memory
+  limit, because the store only grows and a 1024 MiB pod can afford a lazier collector; measured,
+  the benchmark now triggers no collection at all.
+
+### The bug the port introduced, and the check that catches it
+
+`drain` re-parsed the request head on every read rather than keeping it, so a body that arrived in
+a second segment earned a second `100 Continue` -- three of them, for a body in three segments. The
+suite never sends `Expect: 100-continue` at all and would never have noticed. The head lives on the
+connection now, and `tools/http-check.mjs` grew a check that sends the head and then the body in
+two more segments and counts the interim answers; it reports **3** against the binary built from
+the commit before the fix and **1** after, and the Node server passes it unchanged.
+
+### Binary size
+
+4,231,328 bytes against the rules' 8 MiB per-file cap, statically linked, `CGO_ENABLED=0`. Most of
+the headroom came from not using `net/http`: the lifecycle's two request shapes (`POST /register`,
+`GET /done`) would have dragged in `crypto/tls`, `crypto/x509`, the FIPS module and HTTP/2 for
+about three megabytes, and the harness always builds the env's origin as plain `http`
+(`cli/makefun.mjs` `serviceEndpoint`: `http://env:8080` in a container, `http://127.0.0.1:<port>`
+under the process driver). `go/envclient.go` is that client by hand, one keep-alive connection,
+small enough to read in one sitting. `tools/build-go.sh` refuses to leave a binary that breaks the
+cap or names a dynamic loader.
+
 ## How to measure
 
 ```sh
-node tools/bench.mjs --repeat 3                 # the four workloads, median of three fresh forges
+node tools/bench.mjs --repeat 3                 # the Go binary, median of three fresh forges
+node tools/bench.mjs --node --repeat 3          # the Node forge, for the A/B above
 BENCH_REPO=/tmp/before node tools/bench.mjs     # the same workloads against another checkout
-node tools/bench.mjs --only read --prof p.cpuprofile
-node tools/profile.mjs p.cpuprofile route drain writeReply      # inclusive shares
-node tools/micro.mjs                            # the handlers alone, no socket in the way
+node tools/bench.mjs --only read --prof /tmp/go.prof
+go tool pprof -top bin/forge /tmp/go.prof       # where the Go forge's CPU goes
+(cd go && go test -bench . -benchmem -count=3)  # the handlers alone, and their allocations
+node tools/smoke.mjs                            # all four surfaces, fast; --node for the A/B
 node tools/http-check.mjs                       # the wire paths the suite never exercises
+node tools/profile.mjs p.cpuprofile route drain writeReply      # Node only: inclusive shares
+node tools/micro.mjs                            # Node only: the handlers, no socket in the way
 ```
 
-`tools/bench.mjs` drives the kit's own `GitClient`/`RestClient` through the four workloads of
+`tools/bench.mjs` measures whichever forge it is pointed at -- by default the committed binary,
+spawned directly so the pid whose CPU is sampled is the forge itself, and with `--node` the Node
+forge under `FORGE_NO_BINARY=1`, which switches off `main.ts`'s handover. It drives the kit's own
+`GitClient`/`RestClient` through the four workloads of
 `program/env/src/bench.ts` — push (200 sequential 1 KiB pushes), clone (50 concurrent depth-1 clones
 of a 200-commit repository), read (2,000 keep-alive issue GETs), write (200 issue creations), each
 with 5 warm-up operations and 3 timed rounds. It runs the forge under `taskset -c 0` so the forge's
@@ -29,12 +144,18 @@ own CPU lands in the wall clock instead of hiding on a second core, and reports 
 | wall p50 ms | the median timed round, as the grader measures it |
 | forge cpu ms | the forge's on-CPU time over that round, `/proc/<pid>/schedstat` in ns |
 | gc ms | collection time in that round, from a `PerformanceObserver` on `gc` |
-| reads / writes | `read(2)`/`write(2)` on the sockets, counted at libuv's stream handle |
+| reads / writes | `read(2)`/`write(2)` on the sockets, counted inside the forge |
 
 Two warnings learned the hard way. **This box is shared**, so a single wall-time reading is mostly
 noise: compare interleaved runs of two checkouts and take medians, and read the CPU column first.
 And the instrumentation is not free — the GC observer alone costs about 3% of the forge's CPU — so
 the absolute CPU figures here are a slight over-estimate, equally for both sides of a comparison.
+
+## The Node forge's own optimisation, which came first
+
+Everything from here down is the Node forge: the work that cut its CPU by 43% without moving the
+grader, which is the measurement that argued for the port. It still describes `src/`, which still
+serves when `bin/forge` cannot.
 
 ## Grader baseline
 

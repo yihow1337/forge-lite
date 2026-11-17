@@ -291,10 +291,18 @@ func containsToken(raw []byte, needle string) bool {
 
 type conn struct {
 	socket net.Conn
-	buf    []byte
-	scan   int
-	out    []byte
-	chunks []byte
+	// buf holds bytes received and not yet consumed by a request.
+	buf []byte
+	// scan is where the next search for the head's end may start.
+	scan int
+	// head is the request whose body has not all arrived yet, and where in buf that body begins.
+	// It is kept rather than re-parsed so a body that comes in two segments neither re-reads the
+	// head nor earns a second 100 Continue.
+	head    reqHead
+	ownHead bool
+	bodyAt  int
+	out     []byte
+	chunks  []byte
 }
 
 // appendInt appends a non-negative integer without reaching for strconv's general path.
@@ -359,8 +367,6 @@ func (cn *conn) writeReply(reply *Reply, headOnly bool, closeConn bool) error {
 	_, err := cn.socket.Write(out)
 	return err
 }
-
-var errBadFraming = errors.New("the request framing is broken")
 
 // readChunked decodes as much of a chunked body as the buffer holds from bodyAt. It answers the
 // offset just past the body's last byte, -1 while more is needed, or -2 when the framing is broken.
@@ -548,38 +554,43 @@ func growTo(current int) int {
 // false when the connection is finished.
 func (s *forgeServer) drain(cn *conn) bool {
 	for {
-		end := indexCRLFCRLF(cn.buf, cn.scan)
-		if end < 0 {
-			if len(cn.buf) > maxHeadBytes {
+		if !cn.ownHead {
+			end := indexCRLFCRLF(cn.buf, cn.scan)
+			if end < 0 {
+				if len(cn.buf) > maxHeadBytes {
+					cn.socket.Write(badRequestBytes)
+					return false
+				}
+				cn.scan = len(cn.buf) - 3
+				if cn.scan < 0 {
+					cn.scan = 0
+				}
+				return true
+			}
+			head, ok := parseHead(cn.buf[:end+2])
+			if !ok {
 				cn.socket.Write(badRequestBytes)
 				return false
 			}
-			cn.scan = len(cn.buf) - 3
-			if cn.scan < 0 {
-				cn.scan = 0
+			if head.contentLength > maxBodyBytes {
+				cn.writeReply(&Reply{Status: 413, Type: jsonType, Body: tooLargeBody, Stamp: true}, false, true)
+				return false
 			}
-			return true
-		}
-		head, ok := parseHead(cn.buf[:end+2])
-		if !ok {
-			cn.socket.Write(badRequestBytes)
-			return false
-		}
-		if head.contentLength > maxBodyBytes {
-			cn.writeReply(&Reply{Status: 413, Type: "application/json; charset=utf-8", Body: tooLargeBody, Stamp: true}, false, true)
-			return false
-		}
-		bodyAt := end + 4
-		if head.expectContinue {
-			cn.socket.Write(continueBytes)
+			cn.head = head
+			cn.ownHead = true
+			cn.bodyAt = end + 4
+			cn.scan = 0
+			if head.expectContinue {
+				cn.socket.Write(continueBytes)
+			}
 		}
 
+		head := &cn.head
 		var body []byte
 		var consumed int
 		if head.chunked {
-			stop, size := cn.readChunked(bodyAt)
+			stop, size := cn.readChunked(cn.bodyAt)
 			if stop == -1 {
-				cn.scan = 0
 				return true
 			}
 			if stop == -2 {
@@ -589,12 +600,11 @@ func (s *forgeServer) drain(cn *conn) bool {
 			body = cn.chunks[:size]
 			consumed = stop
 		} else {
-			consumed = bodyAt + head.contentLength
+			consumed = cn.bodyAt + head.contentLength
 			if len(cn.buf) < consumed {
-				cn.scan = 0
 				return true
 			}
-			body = cn.buf[bodyAt:consumed]
+			body = cn.buf[cn.bodyAt:consumed]
 		}
 
 		mark := -1
@@ -620,6 +630,7 @@ func (s *forgeServer) drain(cn *conn) bool {
 
 		reply := s.call(&request)
 		writeErr := cn.writeReply(&reply, head.method == "HEAD", head.close)
+		closeAfter := head.close
 
 		// Keep the next request's bytes and let the consumed ones go.
 		if consumed >= len(cn.buf) {
@@ -630,7 +641,8 @@ func (s *forgeServer) drain(cn *conn) bool {
 			cn.buf = cn.buf[:rest]
 		}
 		cn.scan = 0
-		if writeErr != nil || head.close {
+		cn.ownHead = false
+		if writeErr != nil || closeAfter {
 			return false
 		}
 	}
@@ -643,7 +655,7 @@ func (s *forgeServer) call(request *Request) (reply Reply) {
 			message := describeRecovered(recovered)
 			note("[forge]", "the handler panicked: "+message)
 			body := append([]byte(`{"message":`), appendJSONString(nil, message)...)
-			reply = Reply{Status: 500, Type: "application/json; charset=utf-8", Body: append(body, '}'), Stamp: true}
+			reply = Reply{Status: 500, Type: jsonType, Body: append(body, '}'), Stamp: true}
 		}
 	}()
 	return s.handler(request)

@@ -1,13 +1,35 @@
 # github-core-clone-01 — build plan
 
-A standalone GitHub-compatible forge: git smart HTTP, REST v3, GraphQL v4 and MCP, all in
-memory, Node 22 native type stripping, `node:` built-ins only.
+A standalone GitHub-compatible forge: git smart HTTP, REST v3, GraphQL v4 and MCP, all in memory,
+standard library only.
 
-## Modules
+It exists twice. `go/` is what serves a trial, built to `bin/forge` and committed; `src/` is the
+Node 22 forge it was ported from, which `main.ts` falls back to when the binary will not run. The
+two tables below are the same forge in both languages, file for file. [PERF.md](PERF.md) says why.
+
+## Modules, Go (`go/`, what serves)
 
 | file | what it owns |
 | --- | --- |
-| `main.ts` | the kit's lifecycle (unchanged): listen(0), POST /register, poll /done, exit 0 |
+| `main.go` | the lifecycle: listen(0) on 0.0.0.0, POST /register, poll /done, exit 0; GOMAXPROCS and GC tuning; SIGUSR1 pprof, SIGUSR2 counters |
+| `httpserver.go` | HTTP/1.1 over `net.Listener`: keep-alive, pipelining, Content-Length and chunked, `Expect: 100-continue`, one write per response |
+| `envclient.go` | the lifecycle's HTTP client by hand, one keep-alive connection (so `net/http` stays out of the binary) |
+| `router.go` | the routing `app.ts` owns, under one store mutex |
+| `store.go` | repos, refs, object stores, issues, labels, comments, pulls, id counters -- with the JS Maps' insertion order carried explicitly |
+| `objects.go` | sha1 object ids, commit/tree/tag parse + build, tree path get/set/remove, ancestry, 3-way tree merge |
+| `pack.go` | pkt-line codec, pack writer, pack reader (ofs/ref deltas), one pooled zlib engine |
+| `githttp.go` | info/refs, upload-pack v2 ls-refs/fetch (+shallow/deepen) and v0, receive-pack v0 |
+| `rest.go` | every `/api/v3` route |
+| `graphql.go` | the parser, the executor over ordered result objects, introspection |
+| `mcp.go` | JSON-RPC 2.0: `server/discover`, `initialize`, `tools/list`, `tools/call` |
+| `json.go` | `JSON.stringify`'s escaping out, `encoding/json` in |
+| `pack_test.go` | the pack reader's round trip, its bounds, and the benchmarks behind PERF.md |
+
+## Modules, Node (`src/`, the fallback)
+
+| file | what it owns |
+| --- | --- |
+| `main.ts` | the handover to `bin/forge`, and the same lifecycle when it cannot run |
 | `app.ts` | `createApp()`: one `http.Server`, the router, keep-alive + `setNoDelay` tuning |
 | `src/store.ts` | repos, refs, per-repo object stores, issues, labels, comments, pulls, id counters |
 | `src/git/objects.ts` | sha1 object ids, commit/tree/tag parse + build, tree path get/set/remove, ancestry, 3-way tree merge |
