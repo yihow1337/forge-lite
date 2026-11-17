@@ -15,8 +15,10 @@
 
 import * as http from 'node:http';
 import * as https from 'node:https';
-import type { RequestOptions, Server } from 'node:http';
+import type { RequestOptions } from 'node:http';
 import { createApp } from './app.ts';
+import type { ForgeServer } from './src/http/server.ts';
+import { note } from './src/log.ts';
 
 /** Every line this file writes to stderr starts with this. */
 const TAG = '[entry]';
@@ -36,12 +38,8 @@ const DONE_TIMEOUT_MS = 10_000;
 const DONE_WAIT_MS = 250;
 const DONE_WAIT_MAX_MS = 2_000;
 
-/** Floors for the listener's idle budgets: the benchmark reuses one socket for thousands of calls. */
-const KEEP_ALIVE_FLOOR_MS = 120_000;
-const HEADERS_FLOOR_MS = 125_000;
-
 function log(line: string): void {
-  process.stderr.write(`${TAG} ${line}\n`);
+  note(TAG, line);
 }
 
 function wait(ms: number): Promise<void> {
@@ -158,7 +156,7 @@ function parseJson(body: string): unknown {
  * Bind an ephemeral port. listen(0) picks one from the local range, which is far above 8080, but the
  * rebind keeps the promise the contract makes rather than trusting sysctl.
  */
-function bind(server: Server): Promise<number> {
+function bind(server: ForgeServer): Promise<number> {
   return new Promise<number>((resolve, reject) => {
     const attempt = (left: number): void => {
       const onError = (err: Error): void => reject(err);
@@ -244,7 +242,7 @@ async function awaitDone(origin: URL, agent: http.Agent): Promise<void> {
 }
 
 /** Stop listening, hang up on whatever is still parked on a keep-alive socket, and leave. */
-function leave(server: Server, agent: http.Agent, code: number): void {
+function leave(server: ForgeServer, agent: http.Agent, code: number): void {
   try {
     server.close();
     server.closeIdleConnections();
@@ -260,11 +258,6 @@ async function main(): Promise<void> {
   const origin = envOrigin();
   const agent = new http.Agent({ keepAlive: true, keepAliveMsecs: 10_000, maxSockets: 4 });
   const server = createApp();
-
-  // app.ts already picks generous idle budgets; raise them rather than lower them, so neither file
-  // can quietly shorten the other's keep-alive window out from under the benchmark.
-  if (server.keepAliveTimeout < KEEP_ALIVE_FLOOR_MS) server.keepAliveTimeout = KEEP_ALIVE_FLOOR_MS;
-  if (server.headersTimeout < HEADERS_FLOOR_MS) server.headersTimeout = HEADERS_FLOOR_MS;
 
   // The harness SIGTERMs the entry when the trial ends; that is a clean finish, not a failure.
   for (const signal of ['SIGTERM', 'SIGINT'] as const) {
