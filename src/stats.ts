@@ -12,6 +12,7 @@
 
 import { writeFileSync } from 'node:fs';
 import { Session } from 'node:inspector';
+import { PerformanceObserver } from 'node:perf_hooks';
 import type { Server } from 'node:net';
 import { counters as serverCounters } from './http/server.ts';
 import { note } from './log.ts';
@@ -20,9 +21,23 @@ import { note } from './log.ts';
 const HANDLE_WRITES = ['writeBuffer', 'writev', 'writeLatin1String', 'writeUtf8String', 'writeAsciiString', 'writeUcs2String'] as const;
 
 let writes = 0;
+let gcMs = 0;
+let gcCount = 0;
+let gcMajorMs = 0;
 
 /** Count the forge's stream writes and dump the counters on SIGUSR2 (bench.mjs reads the line). */
 export function install(server: Server): void {
+  // What a round costs in garbage collection. The forge's own code and the socket both allocate,
+  // and on the grader's gVisor sandbox a collection is far dearer than it is here, so a workload
+  // whose CPU is mostly GC wants fewer allocations rather than a faster handler.
+  new PerformanceObserver((list) => {
+    for (const entry of list.getEntries()) {
+      gcMs += entry.duration;
+      gcCount += 1;
+      // detail.kind 2 is V8's mark-sweep-compact; everything else is a scavenge of the nursery.
+      if ((entry as unknown as { detail?: { kind?: number } }).detail?.kind === 2) gcMajorMs += entry.duration;
+    }
+  }).observe({ entryTypes: ['gc'] });
   server.on('connection', (socket: unknown) => {
     const handle = (socket as { _handle?: Record<string, unknown> })._handle;
     if (handle === undefined || handle === null || handle.__forgeStats === true) return;
@@ -37,9 +52,29 @@ export function install(server: Server): void {
     }
   });
   process.on('SIGUSR2', () => {
-    note('[forge-stats]', JSON.stringify({ ...serverCounters(), writes }));
+    note('[forge-stats]', JSON.stringify({ ...serverCounters(), writes, gcMs: Math.round(gcMs * 100) / 100, gcMajorMs: Math.round(gcMajorMs * 100) / 100, gcCount }));
   });
   if (process.env.FORGE_PROF !== undefined && process.env.FORGE_PROF !== '') installProfiler(process.env.FORGE_PROF);
+  if (process.env.FORGE_HEAP !== undefined && process.env.FORGE_HEAP !== '') installHeapSampler(process.env.FORGE_HEAP);
+}
+
+/**
+ * Sample where the forge allocates, and write the profile on SIGUSR1. A workload whose CPU is
+ * mostly garbage collection is not asking for a faster handler; it is asking for fewer bytes, and
+ * this says which line produces them.
+ */
+function installHeapSampler(path: string): void {
+  const session = new Session();
+  session.connect();
+  session.post('HeapProfiler.enable', () => {
+    session.post('HeapProfiler.startSampling', { samplingInterval: 4_096 });
+  });
+  process.on('SIGUSR1', () => {
+    session.post('HeapProfiler.getSamplingProfile', (_err: unknown, result: { profile: unknown }) => {
+      writeFileSync(path, JSON.stringify(result.profile));
+      note('[forge-stats]', `heap profile written to ${path}`);
+    });
+  });
 }
 
 /**

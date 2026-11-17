@@ -322,6 +322,10 @@ function refuse(conn: Conn): void {
  */
 function readChunked(conn: Conn): number {
   const buf = conn.buf;
+  // A re-scan: every call walks the body from the start, so the decoded chunks must start empty
+  // or a body that arrived in two segments would be assembled with its first half twice.
+  conn.chunks.length = 0;
+  conn.chunkSize = 0;
   let offset = conn.bodyAt;
   for (;;) {
     const lineEnd = buf.indexOf(10, offset);

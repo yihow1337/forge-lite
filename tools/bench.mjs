@@ -50,7 +50,7 @@ const { buildScenario, generateBlobText, scenarioRng } = await import(`${SRC}/wi
 // ---------------------------------------------------------------- options
 
 function parseArgs(argv) {
-  const out = { only: null, rounds: 3, warmup: 5, json: null, taskset: true, label: '', prof: null, repeat: 1 };
+  const out = { only: null, rounds: 3, warmup: 5, json: null, taskset: true, label: '', prof: null, heap: null, repeat: 1 };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--only') out.only = new Set((argv[++i] ?? '').split(',').filter(Boolean));
@@ -60,6 +60,7 @@ function parseArgs(argv) {
     else if (arg === '--label') out.label = argv[++i] ?? '';
     else if (arg === '--repeat') out.repeat = Number.parseInt(argv[++i] ?? '1', 10);
     else if (arg === '--prof') out.prof = argv[++i] ?? '/tmp/forge-prof';
+    else if (arg === '--heap') out.heap = argv[++i] ?? '/tmp/forge-heap.json';
     else if (arg === '--no-taskset') out.taskset = false;
     else throw new Error(`unknown option ${arg}`);
   }
@@ -151,6 +152,7 @@ async function startForge(envUrl) {
       MAKEFUN_SHOP_TOKEN: TOKEN,
       FORGE_STATS: '1',
       ...(OPTIONS.prof === null ? {} : { FORGE_PROF: OPTIONS.prof }),
+      ...(OPTIONS.heap === null ? {} : { FORGE_HEAP: OPTIONS.heap }),
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -327,6 +329,12 @@ async function runWorkload(spec, ctx, forge) {
   // bench.ts warms up with single operations even for the concurrent workload.
   for (let i = 0; i < ctx.warmup; i += 1) await once();
 
+  // Restart the profile here, after the warm-ups: a profile that starts at boot is a quarter
+  // listen()'s DNS lookup and module loading, which no round ever pays for.
+  if (OPTIONS.prof !== null) {
+    forge.child.kill('SIGUSR1');
+    await new Promise((r) => setTimeout(r, 300));
+  }
   const before = await forge.readStats();
   const roundsMs = [];
   const roundsCpu = [];
@@ -353,6 +361,9 @@ async function runWorkload(spec, ctx, forge) {
     responsesPerRound: responses / ctx.rounds,
     writesPerResponse: writes / responses,
     readsPerRound: delta('reads') / ctx.rounds,
+    gcMs: delta('gcMs') / ctx.rounds,
+    gcMajorMs: delta('gcMajorMs') / ctx.rounds,
+    gcCount: delta('gcCount') / ctx.rounds,
     opsPerRound,
     points: points(median(roundsMs), spec.tRef),
   };
@@ -382,7 +393,7 @@ async function runOnce() {
       results.push(await runWorkload(spec, ctx, forge));
     }
   } finally {
-    if (OPTIONS.prof !== null) {
+    if (OPTIONS.prof !== null || OPTIONS.heap !== null) {
       forge.child.kill('SIGUSR1');
       await new Promise((r) => setTimeout(r, 1_000));
     }
@@ -421,6 +432,9 @@ async function main() {
       responsesPerRound: median(across.map((r) => r.responsesPerRound)),
       writesPerResponse: median(across.map((r) => r.writesPerResponse)),
       readsPerRound: median(across.map((r) => r.readsPerRound)),
+      gcMs: median(across.map((r) => r.gcMs)),
+      gcMajorMs: median(across.map((r) => r.gcMajorMs)),
+      gcCount: median(across.map((r) => r.gcCount)),
       points: median(across.map((r) => r.points)),
       runs: across.map((r) => ({ p50Ms: r.p50Ms, cpuMs: r.cpuMs })),
     };
@@ -429,10 +443,10 @@ async function main() {
   const geomean = Math.exp(results.reduce((sum, r) => sum + Math.log(r.p50Ms), 0) / results.length);
   const pad = (text, width) => String(text).padStart(width);
   console.log('');
-  console.log(`workload   wall p50 ms   forge cpu ms   reads/round   writes/round   writes/resp   pts`);
+  console.log(`workload   wall p50 ms   forge cpu ms   gc ms (major)   gcs   reads   writes   w/resp   pts`);
   for (const r of results) {
     console.log(
-      `${r.name.padEnd(8)} ${pad(r.p50Ms.toFixed(1), 12)} ${pad(r.cpuMs.toFixed(1), 14)} ${pad(Math.round(r.readsPerRound), 13)} ${pad(Math.round(r.writesPerRound), 14)} ${pad(r.writesPerResponse.toFixed(2), 13)} ${pad(r.points, 5)}`,
+      `${r.name.padEnd(8)} ${pad(r.p50Ms.toFixed(1), 12)} ${pad(r.cpuMs.toFixed(1), 14)} ${pad(`${r.gcMs.toFixed(1)} (${r.gcMajorMs.toFixed(1)})`, 15)} ${pad(Math.round(r.gcCount), 5)} ${pad(Math.round(r.readsPerRound), 7)} ${pad(Math.round(r.writesPerRound), 8)} ${pad(r.writesPerResponse.toFixed(2), 8)} ${pad(r.points, 5)}`,
     );
   }
   console.log('');

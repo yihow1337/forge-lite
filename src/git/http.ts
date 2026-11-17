@@ -108,12 +108,13 @@ function advertisedRefs(repo: RepoRec): AdvertisedRef[] {
 const CACHE_ENTRIES_MAX = 64;
 
 function cached(repo: RepoRec, key: string, build: () => Buffer): Buffer {
-  const full = `${repo.version}|${key}`;
-  const hit = repo.cache.get(full);
+  // No version in the key: touchGit empties the whole cache on every version bump, so everything
+  // in it already belongs to the current version, and a key built per lookup would be waste.
+  const hit = repo.cache.get(key);
   if (hit !== undefined) {
     // Refresh the entry's place in the Map's insertion order: eviction below drops the coldest key.
-    repo.cache.delete(full);
-    repo.cache.set(full, hit);
+    repo.cache.delete(key);
+    repo.cache.set(key, hit);
     return hit;
   }
   const built = build();
@@ -122,7 +123,7 @@ function cached(repo: RepoRec, key: string, build: () => Buffer): Buffer {
     if (coldest.done === true) break;
     repo.cache.delete(coldest.value);
   }
-  repo.cache.set(full, built);
+  repo.cache.set(key, built);
   return built;
 }
 
@@ -306,9 +307,11 @@ function parseReceiveRequest(body: Buffer): { commands: Command[]; caps: Set<str
       }
       first = false;
     }
-    const parts = line.split(' ');
-    if (parts.length < 3) continue;
-    commands.push({ oldOid: parts[0] as string, newOid: parts[1] as string, ref: parts.slice(2).join(' ') });
+    const firstSpace = line.indexOf(' ');
+    if (firstSpace < 0) continue;
+    const secondSpace = line.indexOf(' ', firstSpace + 1);
+    if (secondSpace < 0 || secondSpace + 1 >= line.length) continue;
+    commands.push({ oldOid: line.slice(0, firstSpace), newOid: line.slice(firstSpace + 1, secondSpace), ref: line.slice(secondSpace + 1) });
   }
   return { commands, caps, pack: body.subarray(decoded.offset) };
 }
@@ -335,7 +338,12 @@ export function handleGit(store: Store, request: GitHttpRequest): GitReply | nul
   const rawRepo = segments[1] as string;
   if (!rawRepo.endsWith('.git')) return null;
   const name = rawRepo.slice(0, -4);
-  const tail = segments.slice(2).join('/');
+  const tail =
+    segments.length === 3
+      ? (segments[2] as string)
+      : segments.length === 4 && segments[2] === 'info' && segments[3] === 'refs'
+        ? 'info/refs'
+        : '';
   if (tail !== 'info/refs' && tail !== 'git-upload-pack' && tail !== 'git-receive-pack') return null;
   store.latchOwner(owner);
   const repo = store.repo(owner, name);
@@ -424,7 +432,7 @@ function uploadPack(repo: RepoRec, request: GitHttpRequest): GitReply {
 function receivePack(repo: RepoRec, request: GitHttpRequest): GitReply {
   const parsed = parseReceiveRequest(request.body);
   const sidebandWanted = parsed.caps.has('side-band-64k') || parsed.caps.has('side-band');
-  const lines: string[] = [];
+  let report = '';
   let unpackDetail = 'ok';
   if (parsed.pack.length > 0) {
     try {
@@ -434,43 +442,41 @@ function receivePack(repo: RepoRec, request: GitHttpRequest): GitReply {
       unpackDetail = `index-pack failed: ${err instanceof Error ? err.message : String(err)}`;
     }
   }
-  lines.push(`unpack ${unpackDetail}\n`);
+  report += pktText(`unpack ${unpackDetail}\n`);
 
   let changed = false;
   for (const command of parsed.commands) {
     if (unpackDetail !== 'ok') {
-      lines.push(`ng ${command.ref} unpacker error\n`);
+      report += pktText(`ng ${command.ref} unpacker error\n`);
       continue;
     }
     const current = repo.refs.get(command.ref);
     if (command.newOid === ZERO_OID) {
       if (current === undefined) {
-        lines.push(`ng ${command.ref} deletion of a ref that does not exist\n`);
+        report += pktText(`ng ${command.ref} deletion of a ref that does not exist\n`);
         continue;
       }
       repo.refs.delete(command.ref);
       changed = true;
-      lines.push(`ok ${command.ref}\n`);
+      report += pktText(`ok ${command.ref}\n`);
       continue;
     }
     if (!repo.objects.has(command.newOid)) {
-      lines.push(`ng ${command.ref} missing necessary objects\n`);
+      report += pktText(`ng ${command.ref} missing necessary objects\n`);
       continue;
     }
     if (current === undefined || current === command.newOid || isAncestor(repo.objects, current, command.newOid)) {
       repo.refs.set(command.ref, command.newOid);
       changed = true;
-      lines.push(`ok ${command.ref}\n`);
+      report += pktText(`ok ${command.ref}\n`);
       continue;
     }
-    lines.push(`ng ${command.ref} non-fast-forward\n`);
+    report += pktText(`ng ${command.ref} non-fast-forward\n`);
   }
   if (changed || parsed.pack.length > 0) touchGit(repo);
 
   // The report is a handful of short lines; one string and one encode, not a Buffer a line.
-  let inner = '';
-  for (const line of lines) inner += pktText(line);
-  inner += FLUSH_TEXT;
+  const inner = `${report}${FLUSH_TEXT}`;
   const text = sidebandWanted ? `${sidebandText(inner)}${FLUSH_TEXT}` : inner;
   return { status: 200, type: RECEIVE_RESULT, body: Buffer.from(text, 'utf8') };
 }
