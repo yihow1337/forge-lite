@@ -6,6 +6,11 @@
 # commit runs from your repository as vendored source") and cap one file at 8 MiB, so this script
 # refuses to leave a binary that would be rejected.
 #
+# -buildvcs=false is what makes --check mean anything: with VCS stamping on, `go build` embeds the
+# commit, the commit time and whether the tree was dirty, so a binary committed in one commit can
+# never byte-match a build made in the next one. Without it the binary depends on the sources and
+# the toolchain alone, which is the property the check is asserting.
+#
 #   tools/build-go.sh            build, verify, report the size
 #   tools/build-go.sh --check    verify the committed binary matches the sources, build nothing
 set -euo pipefail
@@ -25,7 +30,7 @@ test -z "$(gofmt -l .)" || { echo "build-go: gofmt wants changes in: $(gofmt -l 
 if [[ "${1:-}" == "--check" ]]; then
   TMP="$(mktemp /tmp/forge-check.XXXX)"
   trap 'rm -f "$TMP"' EXIT
-  CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$GO" build -trimpath -ldflags="-s -w" -o "$TMP" .
+  CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$GO" build -trimpath -buildvcs=false -ldflags="-s -w" -o "$TMP" .
   if cmp -s "$TMP" "$OUT"; then
     echo "build-go: bin/forge is up to date ($(stat -c %s "$OUT") bytes)"
   else
@@ -36,7 +41,7 @@ if [[ "${1:-}" == "--check" ]]; then
 fi
 
 mkdir -p "$REPO/bin"
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$GO" build -trimpath -ldflags="-s -w" -o "$OUT" .
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$GO" build -trimpath -buildvcs=false -ldflags="-s -w" -o "$OUT" .
 chmod 755 "$OUT"
 
 SIZE="$(stat -c %s "$OUT")"
