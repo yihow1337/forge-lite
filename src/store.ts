@@ -98,7 +98,12 @@ export class Store {
   latchOwner(owner: string): void {
     if (this.ownerLatched) return;
     this.ownerLatched = true;
-    if (owner !== '' && owner !== this.viewer) this.viewer = owner;
+    if (owner === '' || owner === this.viewer) return;
+    this.viewer = owner;
+    for (const repo of this.repos.values()) {
+      repo.owner = owner;
+      repo.json = null;
+    }
   }
 
   /** Whether `owner` is the login this token owns (another login owns nothing here). */

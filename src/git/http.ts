@@ -336,7 +336,7 @@ export function handleGit(store: Store, request: GitHttpRequest): GitReply | nul
   }
 
   try {
-    return receivePack(store, repo, request);
+    return receivePack(repo, request);
   } catch (err) {
     return textReply(400, `bad request: ${err instanceof Error ? err.message : String(err)}\n`);
   }
@@ -392,7 +392,7 @@ function uploadPack(repo: RepoRec, request: GitHttpRequest): GitReply {
   return { status: 200, type: UPLOAD_RESULT, body: fetchBodyV0(repo, args) };
 }
 
-function receivePack(store: Store, repo: RepoRec, request: GitHttpRequest): GitReply {
+function receivePack(repo: RepoRec, request: GitHttpRequest): GitReply {
   const parsed = parseReceiveRequest(request.body);
   const sidebandWanted = parsed.caps.has('side-band-64k') || parsed.caps.has('side-band');
   const lines: string[] = [];
@@ -439,6 +439,6 @@ function receivePack(store: Store, repo: RepoRec, request: GitHttpRequest): GitR
   if (changed || parsed.pack.length > 0) touchGit(repo);
 
   const inner = Buffer.concat([...lines.map((line) => pkt(line)), flushPkt()]);
-  const body = sidebandWanted ? Buffer.concat([...sidebandChunks(inner).map((chunk) => chunk), flushPkt()]) : inner;
+  const body = sidebandWanted ? Buffer.concat([...sidebandChunks(inner), flushPkt()]) : inner;
   return { status: 200, type: RECEIVE_RESULT, body };
 }

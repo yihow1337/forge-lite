@@ -12,6 +12,7 @@ import {
   mergeBase,
   mergeTrees,
   parseCommit,
+  parseTree,
   peel,
   putObject,
   treeLookup,
@@ -575,52 +576,20 @@ function contentsRoute(store: Store, repo: RepoRec, pathSegments: string[], requ
   return error(404, NOT_FOUND);
 }
 
+/** One directory's own entries (never recursive), as the contents API lists them. */
 function directoryListing(repo: RepoRec, treeOid: string, prefix: string): unknown[] {
   const object = repo.objects.get(treeOid);
   if (object === undefined || object.type !== 'tree') return [];
   const out: unknown[] = [];
-  for (const [path, entry] of flattenTreeShallow(repo, treeOid, prefix)) {
-    if (entry.kind === 'dir') {
+  for (const entry of parseTree(object.data)) {
+    const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
+    if (entry.mode === '40000') {
       out.push({ type: 'dir', name: entry.name, path, sha: entry.oid, size: 0, url: '', html_url: '', git_url: '', download_url: null, _links: {} });
     } else {
       out.push(contentEntry(repo, path, entry.oid, false));
     }
   }
   return out;
-}
-
-interface ShallowEntry {
-  kind: 'dir' | 'file';
-  name: string;
-  oid: string;
-}
-
-function flattenTreeShallow(repo: RepoRec, treeOid: string, prefix: string): Array<[string, ShallowEntry]> {
-  const object = repo.objects.get(treeOid);
-  if (object === undefined || object.type !== 'tree') return [];
-  const out: Array<[string, ShallowEntry]> = [];
-  for (const entry of parseTreeEntries(repo, treeOid)) {
-    const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
-    out.push([path, { kind: entry.mode === '40000' ? 'dir' : 'file', name: entry.name, oid: entry.oid }]);
-  }
-  return out;
-}
-
-function parseTreeEntries(repo: RepoRec, treeOid: string): Array<{ mode: string; name: string; oid: string }> {
-  const object = repo.objects.get(treeOid);
-  if (object === undefined || object.type !== 'tree') return [];
-  const entries: Array<{ mode: string; name: string; oid: string }> = [];
-  const data = object.data;
-  let offset = 0;
-  while (offset < data.length) {
-    const space = data.indexOf(0x20, offset);
-    if (space < 0) break;
-    const nul = data.indexOf(0x00, space + 1);
-    if (nul < 0) break;
-    entries.push({ mode: data.toString('latin1', offset, space), name: data.toString('utf8', space + 1, nul), oid: data.toString('hex', nul + 1, nul + 21) });
-    offset = nul + 21;
-  }
-  return entries;
 }
 
 // ---------------------------------------------------------------- labels

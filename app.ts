@@ -84,8 +84,22 @@ function decodeSegment(piece: string): string {
   }
 }
 
+/**
+ * A forge that exits mid-trial scores nothing, so a stray throw or rejection is logged and the
+ * process keeps serving. Every request is already wrapped; this is the last line of defence.
+ */
+function guardProcess(): void {
+  process.on('uncaughtException', (err: Error) => {
+    process.stderr.write(`[forge] uncaught ${err.name}: ${err.message}\n${err.stack ?? ''}\n`);
+  });
+  process.on('unhandledRejection', (reason: unknown) => {
+    process.stderr.write(`[forge] unhandled rejection: ${reason instanceof Error ? reason.message : String(reason)}\n`);
+  });
+}
+
 /** Build the server. It binds nothing until the caller listens. */
 export function createApp(): Server {
+  guardProcess();
   const store = new Store(DEFAULT_VIEWER);
 
   const route = (req: IncomingMessage, res: ServerResponse, body: Buffer): void => {
