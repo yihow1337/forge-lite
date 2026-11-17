@@ -209,11 +209,17 @@ func (s *sliceSink) Write(p []byte) (int, error) {
 
 // ---------------------------------------------------------------- pack reading
 
-// inflater keeps one zlib engine alive across the objects of a pack.
+// inflater keeps one zlib engine alive across the objects of a pack, and across packs: a fresh
+// zlib reader allocates a 32 KiB flate window and its Huffman tables, which the push workload
+// would otherwise pay for two hundred times a round. node:zlib could not be held open like this
+// at all -- _processChunk closes its binding at the end of a stream -- so this is the one saving
+// the port gets for free.
 type inflater struct {
 	reader io.ReadCloser
 	source *bytes.Reader
 }
+
+var inflaters = sync.Pool{New: func() any { return &inflater{} }}
 
 var errObjectTooLarge = errors.New("a packed object is past the object size limit")
 
@@ -460,7 +466,8 @@ func readPack(pack []byte, existing ObjectStore) ([]packObject, error) {
 	byOffset := make(map[int]int, count)
 	deltas := false
 	offset := 12
-	inf := &inflater{}
+	inf := inflaters.Get().(*inflater)
+	defer inflaters.Put(inf)
 	for index := 0; index < count; index++ {
 		entryOffset := offset
 		size, next, first, err := readSizeHeader(body, offset)

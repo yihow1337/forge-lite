@@ -2,12 +2,14 @@
 // tools/http-check.mjs -- wire-level checks for the hand-rolled HTTP/1.1 server.
 //
 // The conformance suite drives the forge through undici, which only ever sends a Content-Length
-// body on a keep-alive connection. src/http/server.ts also claims chunked bodies, pipelining,
-// Expect: 100-continue, HEAD, Connection: close and a 400 for a malformed head, and nothing in
-// the suite would notice if one of those were wrong. This file speaks raw bytes at the socket and
-// checks each of them.
+// body on a keep-alive connection. Both hand-rolled servers -- go/httpserver.go and, behind
+// FORGE_NO_BINARY=1, src/http/server.ts -- also claim chunked bodies, pipelining, Expect:
+// 100-continue, HEAD, Connection: close and a 400 for a malformed head, and nothing in the suite
+// would notice if one of those were wrong. This file speaks raw bytes at the socket and checks
+// each of them.
 //
-//   node tools/http-check.mjs
+//   node tools/http-check.mjs                     the Go server main.ts hands over to
+//   FORGE_NO_BINARY=1 node tools/http-check.mjs   the Node server
 
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
@@ -56,7 +58,10 @@ async function startForge() {
     port,
     stop() {
       done = true;
-      child.kill('SIGKILL');
+      // SIGTERM, not SIGKILL: main.ts forwards it to the Go binary, and a SIGKILLed parent would
+      // leave that child orphaned, polling an env that is about to close.
+      child.kill('SIGTERM');
+      setTimeout(() => child.kill('SIGKILL'), 1_000).unref();
       env.close();
     },
   };

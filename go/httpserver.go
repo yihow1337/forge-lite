@@ -105,6 +105,7 @@ var statusLines = map[int]string{
 var requestSeq atomic.Uint64
 
 var statResponses atomic.Uint64
+var statWrites atomic.Uint64
 var statReads atomic.Uint64
 var statReadBytes atomic.Uint64
 
@@ -354,6 +355,7 @@ func (cn *conn) writeReply(reply *Reply, headOnly bool, closeConn bool) error {
 		// Do not let one large answer pin a megabyte per idle connection.
 		cn.out = nil
 	}
+	statWrites.Add(1)
 	_, err := cn.socket.Write(out)
 	return err
 }

@@ -284,6 +284,11 @@ const FORGE_STARTUP_MS = 3_000;
  * resolves: the binary owns the lifecycle, and this process exits with the binary's code.
  */
 async function delegate(): Promise<void> {
+  // tools/bench.mjs sets this to measure the Node forge against the Go one in the same tool.
+  if (process.env.FORGE_NO_BINARY === '1') {
+    log('FORGE_NO_BINARY=1: serving from Node');
+    return;
+  }
   try {
     accessSync(FORGE_BINARY, constants.X_OK);
   } catch (err) {

@@ -23,7 +23,8 @@
 // Each runs 5 untimed warm-up operations and then 3 timed rounds, and reports the median round.
 //
 // Usage:
-//   node tools/bench.mjs                      all four workloads, full size
+//   node tools/bench.mjs                      the Go binary, all four workloads, full size
+//   node tools/bench.mjs --node               `node main.ts` with the handover disabled
 //   node tools/bench.mjs --only read,write    a subset
 //   node tools/bench.mjs --rounds 1           fewer rounds while iterating
 //   node tools/bench.mjs --repeat 5           five fresh forges, reported as the median of the five
@@ -33,7 +34,7 @@
 
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -50,7 +51,7 @@ const { buildScenario, generateBlobText, scenarioRng } = await import(`${SRC}/wi
 // ---------------------------------------------------------------- options
 
 function parseArgs(argv) {
-  const out = { only: null, rounds: 3, warmup: 5, json: null, taskset: true, label: '', prof: null, heap: null, repeat: 1 };
+  const out = { only: null, rounds: 3, warmup: 5, json: null, taskset: true, label: '', prof: null, heap: null, repeat: 1, node: false };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--only') out.only = new Set((argv[++i] ?? '').split(',').filter(Boolean));
@@ -62,12 +63,16 @@ function parseArgs(argv) {
     else if (arg === '--prof') out.prof = argv[++i] ?? '/tmp/forge-prof';
     else if (arg === '--heap') out.heap = argv[++i] ?? '/tmp/forge-heap.json';
     else if (arg === '--no-taskset') out.taskset = false;
+    else if (arg === '--node') out.node = true;
+    else if (arg === '--binary') out.node = false;
     else throw new Error(`unknown option ${arg}`);
   }
   return out;
 }
 
 const OPTIONS = parseArgs(process.argv.slice(2));
+/** Which forge the last run started: reported with the table so a number is never misattributed. */
+let KIND = 'unknown';
 const TOKEN = 'bench-token';
 
 // The same fixture constants bench.ts uses, so the payloads are byte-identical to the grader's.
@@ -132,18 +137,38 @@ function startEnvStub() {
 
 // ---------------------------------------------------------------- the forge under test
 
-/** The process's own on-CPU time in ms (schedstat field 0 is nanoseconds; far finer than ticks). */
+/**
+ * The process's own on-CPU time in ms. schedstat field 0 is nanoseconds, far finer than ticks --
+ * but /proc/<pid>/schedstat covers the main thread alone, and the Go forge serves on whichever
+ * thread the scheduler picked, so this sums every thread of the group.
+ */
 function cpuMsOf(pid) {
   try {
-    return Number(readFileSync(`/proc/${pid}/schedstat`, 'utf8').split(' ')[0]) / 1e6;
+    let total = 0;
+    for (const tid of readdirSync(`/proc/${pid}/task`)) {
+      try {
+        total += Number(readFileSync(`/proc/${pid}/task/${tid}/schedstat`, 'utf8').split(' ')[0]);
+      } catch {
+        // a thread that exited between the listing and the read contributes what it had, which
+        // we cannot recover; the forge's threads live for the whole run, so this is noise only.
+      }
+    }
+    return total / 1e6;
   } catch {
     return Number.NaN;
   }
 }
 
+/**
+ * The forge under test. By default that is the committed Go binary, spawned directly so the pid
+ * whose CPU is measured IS the forge; `--node` runs `node main.ts` with the handover disabled,
+ * which is how the two are compared in one tool.
+ */
 async function startForge(envUrl) {
-  const command = OPTIONS.taskset ? 'taskset' : 'node';
-  const args = OPTIONS.taskset ? ['-c', '0', 'node', 'main.ts'] : ['main.ts'];
+  const binary = process.env.FORGE_BIN ?? `${REPO}/bin/forge`;
+  const runsNode = OPTIONS.node || !existsSync(binary);
+  const program = runsNode ? ['node', 'main.ts'] : [binary];
+  const [command, ...args] = OPTIONS.taskset ? ['taskset', '-c', '0', ...program] : program;
   const child = spawn(command, args, {
     cwd: REPO,
     env: {
@@ -151,6 +176,7 @@ async function startForge(envUrl) {
       MAKEFUN_ENV_URL: envUrl,
       MAKEFUN_SHOP_TOKEN: TOKEN,
       FORGE_STATS: '1',
+      ...(runsNode ? { FORGE_NO_BINARY: '1' } : {}),
       ...(OPTIONS.prof === null ? {} : { FORGE_PROF: OPTIONS.prof }),
       ...(OPTIONS.heap === null ? {} : { FORGE_HEAP: OPTIONS.heap }),
     },
@@ -177,6 +203,7 @@ async function startForge(envUrl) {
   });
   return {
     child,
+    kind: runsNode ? 'node' : 'go',
     /** Ask the forge to dump its counters and wait for the line to arrive. */
     async readStats() {
       stats = null;
@@ -383,6 +410,7 @@ async function runOnce() {
   const scenario = buildScenario();
   const owner = scenario.viewer.login;
 
+  KIND = forge.kind;
   const results = [];
   try {
     for (const spec of WORKLOADS) {
@@ -441,6 +469,8 @@ async function main() {
   });
 
   const geomean = Math.exp(results.reduce((sum, r) => sum + Math.log(r.p50Ms), 0) / results.length);
+  console.log('');
+  console.log(`forge: ${KIND}${OPTIONS.taskset ? ', pinned to core 0' : ''}`);
   const pad = (text, width) => String(text).padStart(width);
   console.log('');
   console.log(`workload   wall p50 ms   forge cpu ms   gc ms (major)   gcs   reads   writes   w/resp   pts`);

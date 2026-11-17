@@ -22,6 +22,7 @@ import (
 	"os/signal"
 	"runtime"
 	"runtime/debug"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -237,17 +238,57 @@ func clip(text string) string {
 	return trimmed
 }
 
-// dumpStats answers a SIGUSR2 with the counters tools/bench.mjs reads.
+// dumpStats answers a SIGUSR2 with the counters tools/bench.mjs reads. The GC figures come from
+// ReadGCStats rather than MemStats: it reads the same totals without stopping the world.
 func dumpStats() {
+	var collected debug.GCStats
+	debug.ReadGCStats(&collected)
 	var line bytes.Buffer
 	line.WriteString(`[forge-stats] {"responses":`)
 	line.WriteString(strconv.FormatUint(statResponses.Load(), 10))
+	line.WriteString(`,"writes":`)
+	line.WriteString(strconv.FormatUint(statWrites.Load(), 10))
 	line.WriteString(`,"reads":`)
 	line.WriteString(strconv.FormatUint(statReads.Load(), 10))
 	line.WriteString(`,"readBytes":`)
 	line.WriteString(strconv.FormatUint(statReadBytes.Load(), 10))
+	line.WriteString(`,"gcMs":`)
+	line.WriteString(strconv.FormatFloat(float64(collected.PauseTotal.Nanoseconds())/1e6, 'f', 3, 64))
+	line.WriteString(`,"gcMajorMs":0,"gcCount":`)
+	line.WriteString(strconv.FormatInt(collected.NumGC, 10))
 	line.WriteString("}\n")
 	os.Stderr.Write(line.Bytes())
+}
+
+// profiling is the CPU profile a SIGUSR1 starts and the next SIGUSR1 stops. It exists only when
+// FORGE_PROF names a file, so a trial never carries the profiler's overhead.
+var profiling *os.File
+
+// toggleProfile starts or stops the CPU profile FORGE_PROF names.
+func toggleProfile() {
+	path := os.Getenv("FORGE_PROF")
+	if path == "" {
+		return
+	}
+	if profiling != nil {
+		pprof.StopCPUProfile()
+		profiling.Close()
+		profiling = nil
+		logEntry("wrote the CPU profile to " + path)
+		return
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		logEntry("could not open " + path + ": " + err.Error())
+		return
+	}
+	if err := pprof.StartCPUProfile(file); err != nil {
+		logEntry("could not start the CPU profile: " + err.Error())
+		file.Close()
+		return
+	}
+	profiling = file
+	logEntry("started a CPU profile into " + path)
 }
 
 // tune sets the runtime knobs for the trial pod: two CPUs, a gigabyte of memory, and a store that
@@ -280,6 +321,13 @@ func main() {
 	go func() {
 		for range usr2 {
 			dumpStats()
+		}
+	}()
+	usr1 := make(chan os.Signal, 1)
+	signal.Notify(usr1, syscall.SIGUSR1)
+	go func() {
+		for range usr1 {
+			toggleProfile()
 		}
 	}()
 	go func() {
